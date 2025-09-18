@@ -1,0 +1,300 @@
+### Horribly bloated import
+
+
+# ---- Setup --------------------------------------------------
+setwd("C:/Jobb/Winroth/Algoritm sepsis 2025-08-15")
+
+
+SEED                    <- 42
+CENSOR_DATE             <- lubridate::ymd("2024-12-31")
+MAX_CONTROLS_PER_EP     <- 4L
+AGE_TOL_YEARS           <- 2L
+PASS2_ALLOWED_DELTAS    <- c(0L, -1L, 1L, -2L, 2L)  # preference order
+set.seed(SEED)
+
+suppressPackageStartupMessages({
+  library(tidyverse)
+  library(readxl)
+  library(lubridate)
+  library(data.table)
+  library(survival)
+  library(survminer)
+  library(tidyr)
+  library(ggplot2)
+})
+
+# ---- Helpers: datetime normalization ------------------------
+parse_utcish <- function(x) {
+  if (inherits(x, "POSIXt")) return(x)
+  x_chr <- as.character(x)
+  x_chr <- stringr::str_remove(x_chr, " UTC$")
+  x_chr <- ifelse(stringr::str_detect(x_chr, "^\\d{4}-\\d{2}-\\d{2}$"),
+                  paste0(x_chr, " 00:00:00"), x_chr)
+  lubridate::ymd_hms(x_chr, tz = "UTC", quiet = TRUE)
+}
+
+fix_datetimes <- function(.data, cols) {
+  cols <- intersect(cols, names(.data))
+  if (length(cols) == 0) return(.data)
+  dplyr::mutate(.data, dplyr::across(dplyr::all_of(cols), parse_utcish))
+}
+
+# ---- Load & preprocess --------------------------------------
+df <- read_xlsx("data/Underlag för KM och BSI_1.xlsx", sheet = 1)
+
+df <- fix_datetimes(
+  df,
+  cols = c(
+    "Inskrivningstid_2",
+    "Utskrivningstid",
+    "Pat med sepsis (CA och HO)_Tidpunkt för algoritm positiv",
+    "Patienter med CA sepsis_Tidpunkt för algoritm positiv",
+    "Patienter med HO sepsis_Tidpunkt för algoritm positiv"
+  )
+)
+
+# If these are present as dates already, ymd will leave them unchanged
+df <- df %>%
+  mutate(
+    In_kort     = ymd(In_kort),
+    Ut_kort     = ymd(Ut_kort),
+    CA_sepsis_kort = ymd(as.Date(`Patienter med CA sepsis_Tidpunkt för algoritm positiv`)),
+    HO_sepsis_kort = ymd(as.Date(`Patienter med HO sepsis_Tidpunkt för algoritm positiv`)),
+    Sepsis_kort = ymd(as.Date(`Pat med sepsis (CA och HO)_Tidpunkt för algoritm positiv`)),
+    Sepsis_dag  = as.numeric(Sepsis_kort - In_kort),
+    `Avliden datum` = as.Date(as.numeric(`Avliden datum`), origin = "1899-12-30")
+  )
+
+# Guard: sepsis before admission → clamp to 0 days
+df$Sepsis_dag[df$Sepsis_dag < 0 & !is.na(df$Sepsis_dag)] <- 0
+
+
+
+
+
+
+
+
+
+
+
+
+## Wilson (score) CI for sepsis prevalence, then project to N = 82,112
+## Base R only (uses prop.test, which returns a Wilson score CI)
+
+# Inputs
+x <- 63L      # true sepsis in the labeled sample
+n <- 1087L    # labeled sample size
+N <- 82112L   # target population size
+
+# Wilson CI with continuity correction (recommended default in base R)
+pt <- prop.test(x, n, correct = TRUE, conf.level = 0.95)
+
+# Prevalence point estimate and CI
+p_hat <- unname(x / n)
+ci_p  <- unname(pt$conf.int)          # lower, upper
+
+# Project to counts in the full population
+est_count <- as.integer(round(N * p_hat))
+ci_count  <- as.integer(round(N * ci_p))
+
+# Tidy summary
+out <- data.frame(
+  method      = "Wilson (score) CI with continuity correction",
+  x           = x,
+  n           = n,
+  p_hat       = p_hat,
+  p_lo        = ci_p[1],
+  p_hi        = ci_p[2],
+  N           = N,
+  cases_hat   = est_count,
+  cases_lo    = ci_count[1],
+  cases_hi    = ci_count[2]
+)
+print(out)
+
+# ---- Optional: Wilson WITHOUT continuity correction (slightly tighter CI) ----
+# pt_nc <- prop.test(x, n, correct = FALSE, conf.level = 0.95)
+# ci_p_nc  <- unname(pt_nc$conf.int)
+# ci_cnt_nc <- as.integer(round(N * ci_p_nc))
+# c(noCC_cases_lo = ci_cnt_nc[1], noCC_cases_hi = ci_cnt_nc[2])
+
+#### Incidence calculations
+
+## Incidence per 100,000 citizens per year from a binomial sample
+## - Enter your observation window (start/end), sample counts (x, n), and population size N.
+## - Uses Wilson (score) CI for prevalence, then converts to an annualized incidence rate.
+
+## Inputs
+start_date <- as.Date(min(df$Inskrivningstid_1, na.rm = T))   # ← observation period start
+end_date   <- as.Date(max(df$Inskrivningstid_1, na.rm = T))   # ← observation period end
+
+
+
+x        <- 63L        # labeled sepsis cases in the admissions sample
+n        <- 1087L      # labeled admissions in the sample
+N_adm    <- 82112L     # total admissions in the observation window
+POP_catchment <- 224004L   # citizens served by the hospital (tweakable)
+
+# Optional adjustment factors (keep at 1.00 if not needed)
+residency_fraction     <- 1.00  # fraction of identified cases who are catchment residents
+first_episode_fraction <- 1.00  # fraction that are first episodes (no duplicate person-episodes)
+
+## Duration (years)
+T_years <- tryCatch({
+  if (requireNamespace("lubridate", quietly = TRUE)) {
+    lubridate::time_length(lubridate::interval(start_date, end_date + 1), unit = "years")
+  } else {
+    as.numeric(end_date - start_date + 1) / 365.25
+  }
+}, error = function(e) as.numeric(end_date - start_date + 1) / 365.25)
+
+## Wilson (score) 95% CI for prevalence among admissions
+pt   <- prop.test(x, n, correct = TRUE, conf.level = 0.95)
+p_hat <- unname(x / n)
+p_CI  <- unname(pt$conf.int)  # [lower, upper]
+
+## Project to total *admission-derived* case counts
+cases_hat <- N_adm * p_hat
+cases_lo  <- N_adm * p_CI[1]
+cases_hi  <- N_adm * p_CI[2]
+
+## Apply optional adjustments (residency / first episodes)
+adj_factor <- residency_fraction * first_episode_fraction
+cases_hat_adj <- cases_hat * adj_factor
+cases_lo_adj  <- cases_lo  * adj_factor
+cases_hi_adj  <- cases_hi  * adj_factor
+
+## Incidence per 100,000 citizens per year (person-time denominator)
+inc_100k_hat <- (cases_hat_adj / (POP_catchment * T_years)) * 1e5
+inc_100k_lo  <- (cases_lo_adj  / (POP_catchment * T_years)) * 1e5
+inc_100k_hi  <- (cases_hi_adj  / (POP_catchment * T_years)) * 1e5
+
+## Tidy summary
+out <- data.frame(
+  start_date, end_date, T_years = round(T_years, 4),
+  x, n, N_adm, POP_catchment,
+  residency_fraction, first_episode_fraction, adj_factor,
+  p_hat = p_hat, p_lo = p_CI[1], p_hi = p_CI[2],
+  cases_hat = round(cases_hat), cases_lo = round(cases_lo), cases_hi = round(cases_hi),
+  cases_hat_adj = round(cases_hat_adj), cases_lo_adj = round(cases_lo_adj), cases_hi_adj = round(cases_hi_adj),
+  incidence_100k_hat = round(inc_100k_hat, 1),
+  incidence_100k_lo  = round(inc_100k_lo, 1),
+  incidence_100k_hi  = round(inc_100k_hi, 1)
+)
+
+print(out, row.names = FALSE)
+
+
+
+# Estimate of number of true admissions in our 82112 admissions 
+63/1087 * 82112
+
+# Taking the estimated number of admissions during our 29 month
+# and normalising it over the hospitals catchment population and 100 000 citizens
+939/(223826 * 30 / 12) * 100000
+
+
+
+cat(sprintf(
+  "\nIncidence per 100,000 citizens per year: %.1f (95%% CI %.1f–%.1f)\n",
+  inc_100k_hat, inc_100k_lo, inc_100k_hi
+))
+cat(sprintf(
+  "Assumptions: numerator from admissions; multiplied by residency_fraction=%.2f and first_episode_fraction=%.2f.\n",
+  residency_fraction, first_episode_fraction
+))
+
+
+# Weekly histogram of positive diagnoses from:
+# df$`Pat med sepsis (CA och HO)_Tidpunkt för algoritm positiv`
+
+
+
+# 1) Daily counts (drop NA date)
+daily <- df %>%
+  filter(!is.na(Sepsis_kort)) %>%
+  group_by(Sepsis_kort) %>%
+  summarise(n = n(), .groups = "drop")
+
+# 2) Weekly counts (ISO week starting Monday)
+weekly <- daily %>%
+  mutate(week = floor_date(Sepsis_kort, unit = "week", week_start = 1)) %>%
+  group_by(week) %>%
+  summarise(n = sum(n), .groups = "drop")
+
+# 3) Monthly counts (calendar months)
+monthly <- daily %>%
+  mutate(month = floor_date(Sepsis_kort, unit = "month")) %>%
+  group_by(month) %>%
+  summarise(n = sum(n), .groups = "drop")
+
+# --- PLOTS ---
+
+# Weekly plot
+ggplot(weekly, aes(x = week, y = n)) +
+  geom_col(width = 7) +
+  labs(title = "Weekly positives", x = "Week start", y = "Count") +
+  theme_minimal(base_size = 12) +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+# Monthly plot (no extra 2022-06 / 2025-01 ticks)
+ggplot(monthly, aes(x = month, y = n)) +
+  geom_col(width = 25) +
+  scale_x_date(date_breaks = "1 month", date_labels = "%Y-%m",
+               expand = expansion(add = c(0, 0))) +   # <- no padding
+  labs(title = "Monthly positives", x = "Month", y = "Count") +
+  theme_minimal(base_size = 12) +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+
+
+# Monthly plot (no extra 2022-06 / 2025-01 ticks)
+ggplot(daily, aes(x = n, y = n)) +
+  geom_col(width = 25) +
+  scale_x_date(date_breaks = "1 day", date_labels = "%Y-%m",
+               expand = expansion(add = c(0, 0))) +   # <- no padding
+  labs(title = "Monthly positives", x = "Month", y = "Count") +
+  theme_minimal(base_size = 12) +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+# (Optional) If you want empty weeks/months to show as zeros, add after making
+# 'weekly' / 'monthly':
+#   weekly  <- weekly  %>% tidyr::complete(week  = seq(min(week),  max(week),  by = "week"),  fill = list(n = 0))
+#   monthly <- monthly %>% tidyr::complete(month = seq(min(month), max(month), by = "month"), fill = list(n = 0))
+
+
+df %>% group_by(Sepsis_kort) %>% count() %>% print(n = Inf)
+
+
+
+
+
+
+OBS_START <- as.Date("2022-07-01")
+OBS_END   <- as.Date("2024-12-31")
+
+# 1) Daily counts (drop NA date)
+daily <- df %>%
+  filter(!is.na(Sepsis_kort)) %>%
+  group_by(Sepsis_kort) %>%
+  summarise(n = n(), .groups = "drop")
+
+# 2) Clamp to window and fill missing days with 0
+daily_full <- daily %>%
+  mutate(Sepsis_kort = as.Date(Sepsis_kort)) %>%
+  filter(Sepsis_kort >= OBS_START, Sepsis_kort <= OBS_END) %>%
+  complete(Sepsis_kort = seq(OBS_START, OBS_END, by = "day"), fill = list(n = 0))
+
+# 3) Daily histogram (bars), month ticks, no extra padding
+ggplot(daily_full, aes(x = Sepsis_kort, y = n)) +
+  geom_col(width = 1) +
+  scale_x_date(
+    breaks = seq(OBS_START, OBS_END, by = "1 month"),
+    labels = function(d) format(d, "%Y-%m"),
+    expand = expansion(add = c(0, 0))
+  ) +
+  labs(title = "Daily positives", x = "Date", y = "Count") +
+  theme_minimal(base_size = 12) +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
